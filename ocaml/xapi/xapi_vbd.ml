@@ -56,23 +56,33 @@ let run_command cmd args =
   let stdout, stderr = print_fork_error (fun () -> Forkhelpers.execute_command_get_output cmd args) in
   debug "XXXX stdout='%s' stderr='%s'" stdout stderr
 
+let is_used ~nbd_device =
+  debug "XXXX checking whether %s is in use" nbd_device;
+  (* First check if the file exists, because "nbd-client -c" returns
+     1 for a non-existent file. *)
+  assert_file_exists nbd_device;
+  try
+    run_command "/usr/sbin/nbd-client" ["-check"; nbd_device];
+    true
+  with Forkhelpers.Spawn_internal_error(stderr, stdout, status) as e ->
+    begin match status with
+      | Unix.WEXITED 1 -> false
+      | _ -> raise e
+    end
+
+let wait_for ~nbd_device ~connected =
+  let rec loop () =
+    if (is_used ~nbd_device <> connected) then begin
+      debug "XXXX nbd device %s conneceted status not yet %b, waiting" nbd_device connected;
+      Unix.sleepf 0.1;
+      loop ()
+    end
+  in
+  loop ()
+
 let start_nbd_client ~unix_socket_path ~export_name =
   assert_file_exists unix_socket_path;
   run_command "/usr/sbin/modprobe" ["nbd"];
-  let is_used ~nbd_device =
-    debug "XXXX checking whether %s is in use" nbd_device;
-    (* First check if the file exists, because "nbd-client -c" returns
-       1 for a non-existent file. *)
-    assert_file_exists nbd_device;
-    try
-      run_command "/usr/sbin/nbd-client" ["-check"; nbd_device];
-      true
-    with Forkhelpers.Spawn_internal_error(stderr, stdout, status) as e ->
-      begin match status with
-        | Unix.WEXITED 1 -> false
-        | _ -> raise e
-      end
-  in
   let find_free_nbd_device () =
     let rec loop i =
       let nbd_device = "/dev/nbd" ^ (string_of_int i) in
@@ -81,9 +91,13 @@ let start_nbd_client ~unix_socket_path ~export_name =
     loop 0
   in
   let run_nbd_client ~nbd_device =
-    print_fork_error (fun () ->
-        run_command "/usr/sbin/nbd-client" ["-unix"; unix_socket_path; nbd_device; "-name"; export_name]
-      )
+    let connect_nbd () =
+      print_fork_error (fun () ->
+          run_command "/usr/sbin/nbd-client" ["-unix"; unix_socket_path; nbd_device; "-name"; export_name]
+        )
+    in
+    connect_nbd ();
+    wait_for ~nbd_device ~connected:true
   in
   debug "XXXX finding free NBD device";
   let nbd_device = find_free_nbd_device () in
@@ -93,7 +107,8 @@ let start_nbd_client ~unix_socket_path ~export_name =
   nbd_device
 
 let stop_nbd_client ~nbd_device =
-  run_command "/usr/sbin/nbd-client" ["-disconnect"; nbd_device]
+  run_command "/usr/sbin/nbd-client" ["-disconnect"; nbd_device];
+  wait_for ~nbd_device ~connected:false
 
 let set_mode ~__context ~self ~value =
   let vm = Db.VBD.get_VM ~__context ~self in
